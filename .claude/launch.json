@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "game-docs", "runtimeExecutable": "python3", "runtimeArgs": ["-m", "http.server", "8124", "--directory", "/Users/alexgorbatov/Documents/alchemist-vs-slimes"], "port": 8124 }
+  ]
+}
