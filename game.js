@@ -70,8 +70,8 @@ const Plat = {
       B.platform.on(E.AUDIO_STATE_CHANGED || 'audio_state_changed', on => { this.audioOn = !!on; Snd.refresh(); });
       B.platform.on(E.PAUSE_STATE_CHANGED || 'pause_state_changed', p => setSysPaused(!!p));
       B.advertisement.on(E.INTERSTITIAL_STATE_CHANGED || 'interstitial_state_changed', s => {
-        if (s === 'opened') setSysPaused(true);
-        if (s === 'closed' || s === 'failed') setSysPaused(false);
+        if (s === 'opened') { this.adOpened = true; setSysPaused(true); }
+        if (s === 'closed' || s === 'failed') { setSysPaused(false); this.adDone(); }
       });
       B.advertisement.on(E.REWARDED_STATE_CHANGED || 'rewarded_state_changed', s => {
         if (s === 'opened') { this.rewardGranted = false; setSysPaused(true); }
@@ -117,9 +117,32 @@ const Plat = {
     if (!this.ok) return;
     try { params ? B.platform.sendMessage(name, params) : B.platform.sendMessage(name); } catch (e) { /* not relayed */ }
   },
-  interstitial() {
-    if (!this.ok) return;
-    try { B.advertisement.showInterstitial(); } catch (e) { /* no ad */ }
+  // Shows a full-screen ad, then calls done (also when there is no ad). Called only right after a button press,
+  // so the ad comes after the player's own action (Yandex Games 4.4), never in the middle of a tap on the field.
+  adCb: null, adOpened: false, adTimer: 0,
+  interstitial(done) {
+    if (!this.ok) { done(); return; }
+    this.adCb = done; this.adOpened = false;
+    // if the platform neither opens nor refuses the ad quickly, go on without it
+    this.adTimer = setTimeout(() => { if (!this.adOpened) this.adDone(); }, 2000);
+    try { B.advertisement.showInterstitial(); } catch (e) { this.adDone(); }
+  },
+  adDone() {
+    clearTimeout(this.adTimer);
+    const cb = this.adCb; this.adCb = null;
+    if (cb) cb();
+  },
+  // After signing in, the bridge switches to the cloud save: merge what the guest earned into it.
+  async afterLogin() {
+    try {
+      const data = await B.storage.get([SAVE_KEY]);
+      const local = { ...save };
+      this.apply(data && data[0]);                        // save now holds the cloud copy (or is unchanged)
+      save.best = Math.max(save.best, local.best);
+      save.speed = local.speed; save.sound = local.sound;
+      if (local.unlocked >= save.unlocked) { save.unlocked = local.unlocked; save.level = local.level; save.runScore = local.runScore; }
+    } catch (e) { /* keep the local progress */ }
+    this.store();
   },
   get rewardedSupported() { return this.ok && !!B.advertisement.isRewardedSupported; },
   rewarded(cb) {
@@ -359,7 +382,7 @@ const G = {
   piece: null, next: null,
   level: 0, speedSel: 0, speedUps: 0, pieces: 0,
   score: 0, slimes: 0, combo: 0,
-  timer: 0, grav: 0, das: 0, tick: 0, revived: false,
+  timer: 0, grav: 0, das: 0, tick: 0, revived: false, adDue: false,
 };
 const In = { left: false, right: false, down: false, downLock: false, pl: false, pr: false, rot: [] };
 let sysPaused = false;
@@ -639,7 +662,7 @@ function win() {
   Plat.msg('level_completed', { world: 'cauldron', level: String(G.level + 1) });
   $('winScore').textContent = G.score;
   showOverlay('ovWin');
-  Plat.interstitial();
+  G.adDue = true;                                         // shown when the player presses a button on this screen
 }
 function gameOver() {
   G.mode = 'over';
@@ -650,14 +673,23 @@ function gameOver() {
   $('overScore').textContent = G.score;
   $('btnRevive').style.display = Plat.rewardedSupported && !G.revived ? '' : 'none';
   showOverlay('ovOver');
-  if (G.revived || !Plat.rewardedSupported) Plat.interstitial();
+  G.adDue = G.revived || !Plat.rewardedSupported;
 }
 // Reward: empty the upper half of the cauldron of stones and carry on.
 function revive() {
-  G.revived = true;
+  G.revived = true; G.adDue = false;
   for (let i = 0; i < W * 8; i++) if (G.grid[i] && !G.grid[i].slime) removeCell(i);
-  G.piece = null; G.phase = 'fall'; G.timer = FALL_T; G.mode = 'play';
+  G.piece = null; G.phase = 'fall'; G.timer = FALL_T; G.mode = 'play'; last = 0; acc = 0;
+  Plat.msg('level_resumed', { world: 'cauldron', level: String(G.level + 1) });   // gameplay starts again
   showOverlay(null);
+}
+// Buttons on the win and game-over screens: the ad due for that screen first, then the action.
+let adBusy = false;
+function afterAd(fn) {
+  if (adBusy) return;
+  if (!G.adDue) { fn(); return; }
+  G.adDue = false; adBusy = true;
+  Plat.interstitial(() => { adBusy = false; fn(); });
 }
 // "Restart" button: every stone leaves the cauldron, the slimes keep their places.
 function askReset() {
@@ -775,7 +807,9 @@ function bindUI() {
   click('btnLbBack', toMenu);
   click('btnLbLogin', () => {
     // after signing in, send the record again: guests' scores are not kept by some platforms
-    try { Plat.login().then(() => { Plat.submitScore(save.best); loadLeaders(); }).catch(() => {}); } catch (e) { /* not supported */ }
+    try {
+      Plat.login().then(() => Plat.afterLogin()).then(() => { Plat.submitScore(save.best); loadLeaders(); }).catch(() => {});
+    } catch (e) { /* not supported */ }
   });
   click('btnPause', pause);
   click('btnResume', resume);
@@ -783,11 +817,11 @@ function bindUI() {
   click('btnResetYes', resetStones);
   click('btnResetNo', resume);
   click('btnPauseMenu', toMenu);
-  click('btnNext', () => startLevel(G.level + 1, true));
-  click('btnWinMenu', toMenu);
-  click('btnRetry', () => startLevel(G.level, false));
-  click('btnOverMenu', toMenu);
-  click('btnRevive', () => Plat.rewarded(revive));
+  click('btnNext', () => afterAd(() => startLevel(G.level + 1, true)));
+  click('btnWinMenu', () => afterAd(toMenu));
+  click('btnRetry', () => afterAd(() => startLevel(G.level, false)));
+  click('btnOverMenu', () => afterAd(toMenu));
+  click('btnRevive', () => { if (!adBusy) Plat.rewarded(revive); });
   click('btnSound', () => { save.sound = !save.sound; Plat.store(); Snd.refresh(); refreshMenu(); });
 
   // keyboard
@@ -845,7 +879,7 @@ function bindUI() {
   document.addEventListener('visibilitychange', () => { if (document.hidden) setSysPaused(true); else setSysPaused(false); });
   // any touch anywhere (swipes on the field included) starts or revives the audio
   ['touchend', 'pointerup', 'click', 'keydown'].forEach(ev => addEventListener(ev, () => Snd.unlock(), { capture: true, passive: true }));
-  if (/[?&]debug\b/.test(location.search)) audioDebug();
+  if (/[?&]debug(?:[=&#]|$)/.test(location.search)) audioDebug();   // not Yandex's debug-mode=16
 }
 // ?debug on the address shows the audio state on screen, to report what a phone does
 function audioDebug() {

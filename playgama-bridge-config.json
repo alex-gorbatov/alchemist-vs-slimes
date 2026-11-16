@@ -1,4 +1,8 @@
 {
+    "sendAnalyticsEvents": false,
+    "advertisement": {
+        "useAdvertisementErrorPopup": false
+    },
     "leaderboards": [
         { "id": "score", "isMain": true }
     ]
